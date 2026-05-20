@@ -15,32 +15,24 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 # DIRECTORY PATHS
 # ══════════════════════════════════════════════════════════════════════════════
 
 # BASE_DIR resolves to the project root (one level above src/)
 BASE_DIR = Path(__file__).resolve().parent.parent
-RAW_DIR = BASE_DIR / "data" / "raw"
-PROCESSED_DIR = BASE_DIR / "data" / "processed"
+RAW_DIR  = BASE_DIR / "data" / "raw"
+DATA_DIR = BASE_DIR / "data" / "processed"
 
 # Ensure the processed directory exists at import time
-PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# FILE PATHS
-# ══════════════════════════════════════════════════════════════════════════════
 
-EQUITY_PRICES_RAW = RAW_DIR / "equity_prices_raw.csv"
-DERIVATIVE_CONTRACTS_RAW = RAW_DIR / "derivative_contracts_raw.csv"
+def _is_valid_cache(path: Path, min_bytes: int = 50) -> bool:
+    
+    return path.exists() and path.stat().st_size >= min_bytes
 
-YIELD_CURVE_F1_RAW = RAW_DIR / "yield_curve_f1_money_market.csv"
-YIELD_CURVE_F2_RAW = RAW_DIR / "yield_curve_f2_government_bonds.csv"
-
-EQUITY_RETURNS_PROCESSED = PROCESSED_DIR / "equity_returns.csv"
-EQUITY_VOLATILITY_PROCESSED = PROCESSED_DIR / "equity_volatility.csv"
-CORRELATION_MATRIX_PROCESSED = PROCESSED_DIR / "correlation_matrix.csv"
-YIELD_CURVE_PROCESSED = PROCESSED_DIR / "yield_curve_processed.csv"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PORTFOLIO CONFIGURATION
@@ -61,9 +53,12 @@ EQUITY_END   = '2025-12-31'
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Regex to detect actual date rows in RBA files (format: DD-Mon-YYYY)
+# e.g. '04-Jan-2011', '13-May-2026'
 _DATE_RE = re.compile(r"^\d{2}-[A-Za-z]{3}-\d{4}$")
 
 # Columns extracted from F1 (money market), mapped to maturity in years.
+# BABs/NCDs = Bank Accepted Bills / Negotiable Certificates of Deposit —
+# the standard short-end benchmark in the Australian money market.
 _F1_COLS = {
     "EOD 1-month BABs/NCDs": 1 / 12,   # ≈ 0.0833 years
     "EOD 3-month BABs/NCDs": 3 / 12,   # = 0.2500 years
@@ -84,21 +79,12 @@ _F2_COLS = {
 # INTERNAL HELPER — RBA FILE PARSER
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _require_file(path: Path) -> None:
-    """Raise an error if a required file does not exist."""
-    if not path.exists():
-        raise FileNotFoundError(f"Required file not found: {path}")
-
-def _validate_no_missing(df: pd.DataFrame, name: str) -> None:
-    """Raise an error if a DataFrame contains missing values."""
-    missing = df.isna().sum()
-    if missing.sum() > 0:
-        raise ValueError(f"Missing values detected in {name}:\n{missing[missing > 0]}")
-
 def _parse_rba_file(path: Path) -> pd.DataFrame:
-    """Parse an RBA CSV file into a clean date-indexed DataFrame."""
-    _require_file(path)
-
+    
+    """
+    Parse an RBA CSV table (F1 or F2) into a clean, date-indexed DataFrame.
+    """
+    
     df = pd.read_csv(
         path,
         skiprows=1,            # skip "F1 INTEREST RATES..." title line
@@ -108,20 +94,13 @@ def _parse_rba_file(path: Path) -> pd.DataFrame:
         low_memory=False,
     )
 
-    df.columns = df.columns.str.strip()
-
     # Retain only rows whose index matches a DD-Mon-YYYY date pattern
     date_mask = df.index.map(lambda x: bool(_DATE_RE.match(str(x).strip())))
     df = df.loc[date_mask].copy()
 
     # Parse string index to proper DatetimeIndex
-    df.index = pd.to_datetime(df.index, format="%d-%b-%Y", errors="coerce")
-    df = df.loc[df.index.notna()]
+    df.index = pd.to_datetime(df.index, format="%d-%b-%Y")
     df.index.name = "Date"
-    df = df.sort_index()
-
-    if df.empty:
-        raise ValueError(f"No valid RBA date rows found in file: {path}")
 
     return df
 
@@ -131,38 +110,28 @@ def _parse_rba_file(path: Path) -> pd.DataFrame:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def load_yield_curve_data(force_refresh: bool = False) -> pd.DataFrame:
-    """Build and cache a 7-point zero-rate yield curve from RBA F1 and F2 tables."""
-    if YIELD_CURVE_PROCESSED.exists() and not force_refresh:
-        print(f"[DataLoader] Loading yield curve from cache: {YIELD_CURVE_PROCESSED.name}")
-        return pd.read_csv(YIELD_CURVE_PROCESSED)
+    
     """
+    Build and cache a 7-point zero-rate yield curve from RBA F1 and F2 tables.
+
     Reads (from data/raw/)
     ----------------------
     yield_curve_f1_money_market.csv     — short end: 1m, 3m, 6m BAB rates
     yield_curve_f2_government_bonds.csv — long end:  2y, 3y, 5y, 10y bond yields
-
-    Returns
-    -------
-    pd.DataFrame with columns:
-        maturity_years (float) — time to maturity in years
-        yield          (float) — annualised zero rate as decimal (e.g. 0.0444)
-        as_of_date     (str)   — the date the rates were observed (YYYY-MM-DD)
     """
     
+    processed_path = DATA_DIR / "yield_curve_processed.csv"
+
+    if _is_valid_cache(processed_path) and not force_refresh:
+        print(f"[DataLoader] Loading yield curve from cache: {processed_path.name}")
+        return pd.read_csv(processed_path)
+
     # ── Parse both raw RBA files ───────────────────────────────────────────
-    print("[DataLoader] Parsing RBA F1 and F2 yield curve files...")
+    print("[DataLoader] Parsing RBA F1 (money market)...")
+    f1 = _parse_rba_file(RAW_DIR / "yield_curve_f1_money_market.csv")
 
-    f1 = _parse_rba_file(YIELD_CURVE_F1_RAW)
-    f2 = _parse_rba_file(YIELD_CURVE_F2_RAW)
-
-    missing_f1 = [col for col in _F1_COLS if col not in f1.columns]
-    missing_f2 = [col for col in _F2_COLS if col not in f2.columns]
-
-    if missing_f1:
-        raise KeyError(f"Missing required F1 columns: {missing_f1}")
-
-    if missing_f2:
-        raise KeyError(f"Missing required F2 columns: {missing_f2}")
+    print("[DataLoader] Parsing RBA F2 (government bonds)...")
+    f2 = _parse_rba_file(RAW_DIR / "yield_curve_f2_government_bonds.csv")
 
     # ── Extract target columns and drop rows with any missing values ───────
     f1_data = (
@@ -194,64 +163,52 @@ def load_yield_curve_data(force_refresh: bool = False) -> pd.DataFrame:
     latest_f2 = f2_data.index.max()
     as_of     = min(latest_f1, latest_f2)
 
+    print(
+        f"[DataLoader] Yield curve as-of: {as_of.date()} "
+        f"(F1 latest: {latest_f1.date()}, F2 latest: {latest_f2.date()})"
+    )
+
     # ── Build unified maturity → yield table ──────────────────────────────
     rows = []
 
     for col, maturity in _F1_COLS.items():
-        available = f1_data.loc[f1_data.index <= as_of, col].dropna()
-        if available.empty:
-            raise ValueError(f"No available F1 observation for column: {col}")
-
-        value = available.iloc[-1]
-
+        # Take the last available observation on or before the as-of date
+        val = f1_data.loc[f1_data.index <= as_of, col].iloc[-1]
         rows.append({
             "maturity_years": round(maturity, 4),
-            "yield": round(value / 100, 6),
-            "as_of_date": str(as_of.date()),
+            "yield":          round(val / 100, 6),   # percent → decimal
         })
 
     for col, maturity in _F2_COLS.items():
-        available = f2_data.loc[f2_data.index <= as_of, col].dropna()
-        if available.empty:
-            raise ValueError(f"No available F2 observation for column: {col}")
-
-        value = available.iloc[-1]
-
+        val = f2_data.loc[f2_data.index <= as_of, col].iloc[-1]
         rows.append({
-            "maturity_years": round(maturity, 4),
-            "yield": round(value / 100, 6),
-            "as_of_date": str(as_of.date()),
+            "maturity_years": maturity,
+            "yield":          round(val / 100, 6),
         })
 
-    curve = (
+    df = (
         pd.DataFrame(rows)
         .sort_values("maturity_years")
         .reset_index(drop=True)
     )
-
-    expected_rows = len(_F1_COLS) + len(_F2_COLS)
+    df["as_of_date"] = str(as_of.date())
 
     # ── Sanity checks ──────────────────────────────────────────────────────
-    if len(curve) != expected_rows:
-        raise ValueError(f"Expected {expected_rows} yield points, got {len(curve)}.")
-    
-    if not (curve["yield"] > 0).all():
-        raise ValueError("One or more yield values are non-positive.")
-
-    if not (curve["yield"] < 0.20).all():
-        raise ValueError("One or more yields exceed 20%; check percent-to-decimal conversion.")
-
-    if not curve["maturity_years"].is_monotonic_increasing:
-        raise ValueError("Yield curve maturities are not increasing.")
+    assert len(df) == len(_F1_COLS) + len(_F2_COLS), \
+        f"Expected {len(_F1_COLS) + len(_F2_COLS)} yield curve points, got {len(df)}"
+    assert (df["yield"] > 0).all(), \
+        "One or more yields are non-positive — check raw data"
+    assert (df["yield"] < 0.20).all(), \
+        "One or more yields exceed 20% — possible parsing error (values still in percent?)"
+    assert df["maturity_years"].is_monotonic_increasing, \
+        "Maturities are not strictly increasing — sort error"
 
     # ── Cache and return ──────────────────────────────────────────────────
-    curve.to_csv(YIELD_CURVE_PROCESSED, index=False)
+    df.to_csv(processed_path, index=False)
+    print(f"[DataLoader] Yield curve saved → {processed_path.name}")
+    print(df.to_string(index=False))
 
-    print(f"[DataLoader] Yield curve as-of: {as_of.date()}")
-    print(f"[DataLoader] Yield curve saved to: {YIELD_CURVE_PROCESSED.name}")
-    print(curve.to_string(index=False))
-
-    return curve
+    return df
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -259,113 +216,131 @@ def load_yield_curve_data(force_refresh: bool = False) -> pd.DataFrame:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def load_equity_prices(
-    tickers: list[str] | None = None,
-    start: str = EQUITY_START,
-    end: str = EQUITY_END,
+    tickers: list = PORTFOLIO_TICKERS,
+    start:   str  = EQUITY_START,
+    end:     str  = EQUITY_END,
     force_refresh: bool = False,
 ) -> pd.DataFrame:
-    """Download or load cached daily adjusted close prices."""
-    tickers = tickers or PORTFOLIO_TICKERS
+    
+    """
+    Download and cache daily Close prices for all portfolio tickers.
+    """
+    
+    cache_path = RAW_DIR / "equity_prices_raw.csv"
 
-    if EQUITY_PRICES_RAW.exists() and not force_refresh:
-        print(f"[DataLoader] Loading equity prices from cache: {EQUITY_PRICES_RAW.name}")
-        prices = pd.read_csv(EQUITY_PRICES_RAW, index_col=0, parse_dates=True)
-        prices = prices.reindex(columns=tickers)
-        _validate_no_missing(prices, "cached equity prices")
-        return prices
+    if _is_valid_cache(cache_path) and not force_refresh:
+        print(f"[DataLoader] Loading equity prices from cache: {cache_path.name}")
+        df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+        # Reorder columns to match PORTFOLIO_TICKERS in case CSV order differs
+        df = df.reindex(columns=tickers)
+        return df
 
     try:
         import yfinance as yf
-    except ImportError as exc:
-        raise ImportError("yfinance is required. Install it with: pip install yfinance") from exc
+    except ImportError:
+        raise ImportError(
+            "yfinance is not installed.  Run:  pip install yfinance"
+        )
 
-    print(f"[DataLoader] Fetching equity prices from Yahoo Finance: {tickers}")
-
+    print(
+        f"[DataLoader] Fetching {tickers} from Yahoo Finance "
+        f"({start} → {end})..."
+    )
     raw = yf.download(
         tickers,
         start=start,
         end=end,
-        auto_adjust=True,
+        auto_adjust=True,   # adjusts for splits and dividends automatically
         progress=False,
     )
 
-    if raw.empty:
-        raise ValueError("No equity price data returned. Check tickers and date range.")
-
     # ── Extract Close prices from MultiIndex columns ───────────────────────
+    # yfinance returns MultiIndex columns when downloading multiple tickers.
+    # The structure is (price_type, ticker): e.g. ('Close', 'CBA.AX').
+    # We select level 0 == 'Close' to get a plain DataFrame of Close prices.
     if isinstance(raw.columns, pd.MultiIndex):
         if "Close" in raw.columns.get_level_values(0):
-            prices = raw["Close"]
+            close = raw["Close"]                           # level 0 = price type
         elif "Close" in raw.columns.get_level_values(1):
-            prices = raw.xs("Close", axis=1, level=1)
+            close = raw.xs("Close", axis=1, level=1)      # level 1 = price type
         else:
-            raise ValueError("Could not locate Close prices in yfinance output.")
+            raise ValueError(
+                "Cannot locate 'Close' prices in yfinance output — "
+                "check yfinance version or ticker symbols."
+            )
     else:
-        if "Close" not in raw.columns:
-            raise ValueError("Could not locate Close column in yfinance output.")
-        prices = raw[["Close"]]
-        prices.columns = tickers[:1]
+        # Single-column fallback (should not occur with multiple tickers)
+        close = raw[["Close"]] if "Close" in raw.columns else raw
 
-    prices = prices.reindex(columns=tickers).dropna()
+    # Enforce consistent column ordering matching PORTFOLIO_TICKERS
+    close = close.reindex(columns=tickers)
+
+    # Drop any rows where one or more tickers have no data (e.g. ASX holidays,
+    # stock halts). This ensures all tickers share the same date index,
+    # which is required for log return and correlation calculations.
+    close = close.dropna()
 
     # ── Sanity checks ──────────────────────────────────────────────────────
-    if prices.empty:
-        raise ValueError("Equity prices are empty after cleaning.")
-
-    if list(prices.columns) != tickers:
-        raise ValueError(f"Expected columns {tickers}, got {list(prices.columns)}.")
-
-    if not (prices > 0).all().all():
-        raise ValueError("Non-positive equity prices detected.")
+    assert not close.empty, \
+        "No equity data returned — check ticker symbols and date range"
+    assert list(close.columns) == tickers, \
+        f"Column mismatch: expected {tickers}, got {list(close.columns)}"
+    assert close.isna().sum().sum() == 0, \
+        "NaN values remain after dropna() — unexpected missing data"
+    assert (close > 0).all().all(), \
+        "Negative or zero prices detected — data corruption"
 
     # ── Cache and return ──────────────────────────────────────────────────
-    prices.to_csv(EQUITY_PRICES_RAW)
+    close.to_csv(cache_path)
+    print(f"[DataLoader] Equity prices cached → {cache_path.name}")
+    print(f"  Trading days: {len(close)} | Date range: "
+          f"{close.index[0].date()} → {close.index[-1].date()}")
+    print("  Latest closing prices:")
+    for t in tickers:
+        print(f"    {t}: ${close[t].iloc[-1]:.2f}")
 
-    print(f"[DataLoader] Equity prices saved to: {EQUITY_PRICES_RAW.name}")
-    print(f"[DataLoader] Date range: {prices.index.min().date()} to {prices.index.max().date()}")
-
-    return prices
-
-# ══════════════════════════════════════════════════════════════════════════════
-# DERIVATIVE CONTRACTS
-# ══════════════════════════════════════════════════════════════════════════════
-
-def load_derivative_contracts() -> pd.DataFrame:
-    """Load raw derivative contract assumptions."""
-    _require_file(DERIVATIVE_CONTRACTS_RAW)
-
-    contracts = pd.read_csv(DERIVATIVE_CONTRACTS_RAW)
-
-    if contracts.empty:
-        raise ValueError("Derivative contracts file is empty.")
-
-    _validate_no_missing(contracts, "derivative contracts")
-
-    return contracts
+    return close
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LOG RETURNS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def compute_log_returns(prices: pd.DataFrame, save: bool = True) -> pd.DataFrame:
-    """Compute daily log returns from price data."""
-    if prices.empty:
-        raise ValueError("Price data is empty.")
+def compute_log_returns(
+    prices: pd.DataFrame,
+    save:   bool = True,
+) -> pd.DataFrame:
+    
+    """
+    Compute daily log returns for all portfolio tickers simultaneously.
 
+    Formula applied column-wise:  r_t = ln(S_t / S_{t-1})
+
+    The first row is always NaN (no prior observation) and is dropped,
+    so the returned DataFrame has len(prices) - 1 rows.
+    """
+    
     returns = np.log(prices / prices.shift(1)).dropna()
 
-    if returns.empty:
-        raise ValueError("Log returns are empty after calculation.")
+    # ── Sanity checks ──────────────────────────────────────────────────────
+    assert not returns.empty, \
+        "Log returns DataFrame is empty — check input price data"
+    assert returns.notna().all().all(), \
+        "NaN values remain in log returns after dropna()"
+    assert list(returns.columns) == list(prices.columns), \
+        "Returns columns do not match price columns"
 
-    _validate_no_missing(returns, "equity returns")
-
-    if list(returns.columns) != list(prices.columns):
-        raise ValueError("Return columns do not match price columns.")
+    print(f"[DataLoader] Log returns computed ({len(returns)} observations):")
+    for t in returns.columns:
+        print(
+            f"  {t}: mean = {returns[t].mean():.5f} | "
+            f"std = {returns[t].std():.5f}"
+        )
 
     if save:
-        returns.to_csv(EQUITY_RETURNS_PROCESSED)
-        print(f"[DataLoader] Log returns saved to: {EQUITY_RETURNS_PROCESSED.name}")
+        path = DATA_DIR / "equity_returns.csv"
+        returns.to_csv(path)
+        print(f"[DataLoader] Log returns saved → {path.name}")
 
     return returns
 
@@ -375,34 +350,41 @@ def compute_log_returns(prices: pd.DataFrame, save: bool = True) -> pd.DataFrame
 # ══════════════════════════════════════════════════════════════════════════════
 
 def estimate_historical_volatility(
-    returns: pd.DataFrame,
-    trading_days: int = 252,
-    save: bool = True,
+    returns:      pd.DataFrame,
+    trading_days: int  = 252,
+    save:         bool = True,
 ) -> pd.Series:
-    """Estimate annualised volatility from daily log returns."""
-    if returns.empty:
-        raise ValueError("Returns data is empty.")
-
-    daily_vol = returns.std()
+    """
+    Annualise the daily log-return standard deviation for all tickers.
+    Formula:  sigma = std(r_t) * sqrt(trading_days)
+    """
+    daily_vol  = returns.std()
     annual_vol = daily_vol * np.sqrt(trading_days)
 
-    if not (annual_vol > 0).all():
-        raise ValueError("One or more volatility estimates are non-positive.")
+    # ── Sanity checks ──────────────────────────────────────────────────────
+    assert (annual_vol > 0).all(), \
+        "One or more tickers have zero or negative volatility — check return data"
+    assert (annual_vol < 2.0).all(), \
+        "One or more tickers exceed 200% annualised volatility — possible data error"
 
-    if not (annual_vol < 2.0).all():
-        raise ValueError("One or more volatility estimates exceed 200%.")
+    print("[DataLoader] Historical volatility estimates:")
+    for t in annual_vol.index:
+        print(
+            f"  {t}: daily σ = {daily_vol[t]:.5f} | "
+            f"annual σ = {annual_vol[t]:.4f} ({annual_vol[t]:.2%})"
+        )
 
     if save:
         summary = pd.DataFrame({
-            "ticker": annual_vol.index,
-            "daily_vol": daily_vol.values.round(6),
-            "annual_vol": annual_vol.values.round(6),
+            "ticker":       annual_vol.index,
+            "daily_vol":    daily_vol.values.round(6),
+            "annual_vol":   annual_vol.values.round(6),
             "trading_days": trading_days,
-            "n_obs": len(returns),
+            "n_obs":        len(returns),
         })
-
-        summary.to_csv(EQUITY_VOLATILITY_PROCESSED, index=False)
-        print(f"[DataLoader] Volatility saved to: {EQUITY_VOLATILITY_PROCESSED.name}")
+        path = DATA_DIR / "equity_volatility.csv"
+        summary.to_csv(path, index=False)
+        print(f"[DataLoader] Volatility saved → {path.name}")
 
     return annual_vol
 
@@ -411,29 +393,30 @@ def estimate_historical_volatility(
 # CORRELATION MATRIX
 # ══════════════════════════════════════════════════════════════════════════════
 
-def compute_correlation_matrix(returns: pd.DataFrame, save: bool = True) -> pd.DataFrame:
-    """Compute the pairwise return correlation matrix."""
-    if returns.empty:
-        raise ValueError("Returns data is empty.")
-
+def compute_correlation_matrix(
+    returns: pd.DataFrame,
+    save:    bool = True,
+) -> pd.DataFrame:
     """
+    Compute the pairwise return correlation matrix across all portfolio tickers.
+
     Used by risk.py for multi-asset parametric VaR. The matrix is symmetric
     with 1.0 on the diagonal by construction.
     """
-
     corr = returns.corr()
 
-    if corr.shape[0] != corr.shape[1]:
-        raise ValueError("Correlation matrix must be square.")
-
-    _validate_no_missing(corr, "correlation matrix")
+    print(
+        f"[DataLoader] Correlation matrix "
+        f"({len(returns.columns)} assets, {len(returns)} observations):"
+    )
+    print(corr.round(4).to_string())
 
     if save:
-        corr.to_csv(CORRELATION_MATRIX_PROCESSED)
-        print(f"[DataLoader] Correlation matrix saved to: {CORRELATION_MATRIX_PROCESSED.name}")
+        path = DATA_DIR / "correlation_matrix.csv"
+        corr.to_csv(path)
+        print(f"[DataLoader] Correlation matrix saved → {path.name}")
 
     return corr
-
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -446,28 +429,18 @@ def run_full_pipeline(
     end:     str  = EQUITY_END,
     force_refresh: bool = False,
 ) -> dict:
-    
     """
-    Run the complete data preparation pipeline.
-    Returns prices, returns, volatilities, correlation matrix, and yield curve.
+    Run the complete data preparation pipeline in one call.
     """
-
-    tickers = tickers or PORTFOLIO_TICKERS
-    
     print("=" * 60)
     print("[DataLoader] Starting full data pipeline...")
     print("=" * 60)
 
-    prices = load_equity_prices(
-        tickers=tickers,
-        start=start,
-        end=end,
-        force_refresh=force_refresh,
-    )
-    returns = compute_log_returns(prices)
+    prices       = load_equity_prices(tickers, start, end, force_refresh)
+    returns      = compute_log_returns(prices)
     volatilities = estimate_historical_volatility(returns)
-    correlation = compute_correlation_matrix(returns)
-    yield_curve = load_yield_curve_data(force_refresh=force_refresh)
+    correlation  = compute_correlation_matrix(returns)
+    yield_curve  = load_yield_curve_data(force_refresh)
 
     print("\n" + "=" * 60)
     print("[DataLoader] ✓ Full pipeline complete.")
